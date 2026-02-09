@@ -224,41 +224,40 @@ def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str], D
             if k8 and k8 not in doc8_to_email:
                 doc8_to_email[k8] = email
 
-        # 2) Index por nombre/apellidos (fallback)
+        # 2) Index por nombre/apellidos (fallback) - robusto
         display = str(row.get(display_col, "")).strip() if display_col else ""
         given = str(row.get(given_col, "")).strip() if given_col else ""
         surname = str(row.get(surname_col, "")).strip() if surname_col else ""
 
-        ap_pat = ""
-        ap_mat = ""
-        nombres = ""
+        keys_to_add: List[str] = []
 
+        # A) Si hay display, generar 2 hipótesis:
+        #    1) AP1 AP2 NOMBRES...
+        #    2) NOMBRES... AP1 AP2 (últimos 2)
         if display:
-            # Intento 1: "AP1 AP2, NOMBRES"
-            if "," in display:
-                left, right = display.split(",", 1)
-                ap_parts = [p for p in left.strip().split() if p]
-                nm_parts = [p for p in right.strip().split() if p]
-                ap_pat = ap_parts[0] if len(ap_parts) >= 1 else ""
-                ap_mat = ap_parts[1] if len(ap_parts) >= 2 else ""
-                nombres = " ".join(nm_parts) if nm_parts else ""
-            else:
-                # Intento 2: "AP1 AP2 NOMBRES..."
-                parts = [p for p in display.strip().split() if p]
-                if len(parts) >= 3:
-                    ap_pat = parts[0]
-                    ap_mat = parts[1]
-                    nombres = " ".join(parts[2:])
+            parts = [p for p in display.replace(",", " ").split() if p]
+            if len(parts) >= 3:
+                # Hipótesis 1: AP1 AP2 + NOMBRES...
+                ap1 = parts[0]
+                ap2 = parts[1]
+                noms = " ".join(parts[2:])
+                keys_to_add.append(person_key_for_match(ap1, ap2, noms))
 
-        # Fallback: given + surname
-        if (not ap_pat and not ap_mat and not nombres) and (given or surname):
-            ap_parts = [p for p in surname.strip().split() if p]
-            ap_pat = ap_parts[0] if len(ap_parts) >= 1 else surname
-            ap_mat = ap_parts[1] if len(ap_parts) >= 2 else ""
-            nombres = given
+                # Hipótesis 2: NOMBRES... + AP1 AP2 (últimos 2)
+                ap1b = parts[-2]
+                ap2b = parts[-1]
+                noms_b = " ".join(parts[:-2])
+                if noms_b:
+                    keys_to_add.append(person_key_for_match(ap1b, ap2b, noms_b))
 
-        if ap_pat or ap_mat or nombres:
-            pk = person_key_for_match(ap_pat, ap_mat, nombres)
+        # B) Fallback given + surname
+        if (given or surname):
+            ap_parts = [p for p in surname.split() if p]
+            ap1 = ap_parts[0] if len(ap_parts) >= 1 else surname
+            ap2 = ap_parts[1] if len(ap_parts) >= 2 else ""
+            keys_to_add.append(person_key_for_match(ap1, ap2, given))
+
+        for pk in keys_to_add:
             if pk and pk not in personkey_to_email:
                 personkey_to_email[pk] = email
 
@@ -337,6 +336,12 @@ def generate_outputs(
     tipo_doc_map, _, _ = _build_catalog_map_by_name(tipo_doc_df, key_col_hint="key", name_col_hint="nombre")
     sedes_map, _, sedes_name_col = _build_catalog_map_by_name(sedes_df, key_col_hint="nombre", name_col_hint="nombre")
 
+    # ✅ Detectar keys de CE desde catálogo (no por texto del consolidado)
+    CE_KEYS: Set[Any] = set()
+    for name_norm, key in tipo_doc_map.items():
+        if ("carnet" in name_norm) or ("extran" in name_norm) or (name_norm.strip() == "ce"):
+            CE_KEYS.add(key)
+
     # Outlook index
     outlook_emails, outlook_doc8_to_email, outlook_personkey_to_email = read_outlook_indexes(outlook_path)
     existentes: Set[str] = set(outlook_emails)
@@ -397,7 +402,7 @@ def generate_outputs(
             add_observado(base, f"No match TipoDocumento para '{tipo_doc_raw}'")
             continue
 
-        # Documento: DNI=8 / CE=9, MATCH=8 (desde doc_key8_for_match)
+        # Documento: DNI=8 / CE=9 (plantilla), MATCH=8 (Fax/doc_key8)
         doc_raw = str(r[col["documento"]]).strip() if col.get("documento") else ""
         if _is_blank(doc_raw):
             add_observado(base, "Documento vacío")
@@ -408,16 +413,20 @@ def generate_outputs(
             add_observado(base, f"Documento inválido: '{doc_raw}'")
             continue
 
-        is_ce = ("carnet" in tipo_doc_norm) or ("extran" in tipo_doc_norm) or (tipo_doc_norm == "ce")
+        # ✅ CE por KEY del catálogo
+        is_ce = tipo_doc_key in CE_KEYS
         target_len = 9 if is_ce else 8
 
-        # Si viene con más dígitos de lo permitido -> OBSERVADO
+        # Si viene con más dígitos de lo permitido -> OBSERVADO (no recortar)
         if len(doc_digits) > target_len:
             add_observado(base, f"Documento con longitud inválida para {'CE' if is_ce else 'DNI'}: '{doc_digits}'")
             continue
 
+        # ✅ Export a plantilla con ceros a la izquierda
         doc_out = doc_digits.zfill(target_len)
-        doc_key8 = doc_key8_for_match(doc_out)  # MATCH SIEMPRE 8
+
+        # ✅ Match SIEMPRE 8 (últimos 8 si CE)
+        doc_key8 = doc_key8_for_match(doc_out)
 
         # Historial opcional: no repetir
         if doc_key8 and doc_key8 in history_doc8:
