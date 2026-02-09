@@ -56,13 +56,31 @@ def _fix_arrow_types(df: pd.DataFrame) -> pd.DataFrame:
     if "TipoDeAdmission_RelationId" in df2.columns:
         df2["TipoDeAdmission_RelationId"] = df2["TipoDeAdmission_RelationId"].astype(str)
 
-    # (opcional) si agregas más columnas mixtas en el futuro
     return df2
+
+def _apply_text_format_for_columns(ws, headers, col_names):
+    """
+    Fuerza formato TEXTO (@) para columnas específicas y convierte valor a string.
+    Esto evita que Excel quite ceros a la izquierda.
+    """
+    header_to_idx = {h: i+1 for i, h in enumerate(headers)}
+    for col_name in col_names:
+        col_idx = header_to_idx.get(col_name)
+        if not col_idx:
+            continue
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=col_idx)
+            cell.number_format = "@"
+            if cell.value is None:
+                continue
+            cell.value = str(cell.value)
 
 def build_template_output(template_path: str, aprobados: pd.DataFrame) -> bytes:
     """
     Exporta SOLO columnas del template (no agrega columnas nuevas),
     porque es el archivo que vas a subir al sistema UAI.
+
+    ✅ Importante: fuerza 'N°_Documento' como TEXTO para que se vean los ceros.
     """
     wb = load_workbook(template_path)
     if SHEET_TARGET not in wb.sheetnames:
@@ -84,14 +102,31 @@ def build_template_output(template_path: str, aprobados: pd.DataFrame) -> bytes:
             if h in row:
                 ws.cell(row=i, column=j, value=row[h])
 
+    # ✅ Forzar N°_Documento como TEXTO (para DNI/CE con ceros)
+    _apply_text_format_for_columns(ws, headers, col_names=["N°_Documento"])
+
     out = BytesIO()
     wb.save(out)
     return out.getvalue()
 
 def build_excel_output(df: pd.DataFrame, sheet_name: str) -> bytes:
+    """
+    Export general (Reporte / Observados).
+    ✅ También forzamos N°_Documento como texto para que se vea igual.
+    """
     out = BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+        # aplicar formato texto en el workbook ya escrito
+        wb = writer.book
+        ws = wb[sheet_name]
+
+        headers = [c.value for c in ws[1]]
+        headers = [h if h is not None else "" for h in headers]
+
+        _apply_text_format_for_columns(ws, headers, col_names=["N°_Documento"])
+
     return out.getvalue()
 
 # =========================
@@ -113,7 +148,6 @@ if consolidado_file and outlook_file:
 
             try:
                 aprobados_df, observados_df = generate_outputs(consolidado_path, outlook_path, TEMPLATE_PATH)
-                # ✅ guardar en session_state
                 st.session_state.aprobados_df = aprobados_df
                 st.session_state.observados_df = observados_df
             finally:
@@ -133,7 +167,6 @@ aprobados_df = st.session_state.aprobados_df
 observados_df = st.session_state.observados_df
 
 if aprobados_df is not None and observados_df is not None:
-    # ✅ Fix Arrow (pyarrow) antes de mostrar
     aprobados_view = _fix_arrow_types(aprobados_df)
     observados_view = _fix_arrow_types(observados_df)
 
@@ -142,7 +175,6 @@ if aprobados_df is not None and observados_df is not None:
     c1.metric("Aprobados", int(len(aprobados_view)))
     c2.metric("Observados", int(len(observados_view)))
 
-    # ✅ conteos de correo (si existen columnas)
     if "EstadoCorreoInstitucional" in aprobados_view.columns:
         ya_tiene = int((aprobados_view["EstadoCorreoInstitucional"] == "YA_TIENE").sum())
         generar = int((aprobados_view["EstadoCorreoInstitucional"] == "GENERAR").sum())
@@ -160,13 +192,8 @@ if aprobados_df is not None and observados_df is not None:
     # Descargas
     # =========================
     try:
-        # 1) Plantilla oficial para subir (solo columnas del template)
         plantilla_bytes = build_template_output(TEMPLATE_PATH, aprobados_view)
-
-        # 2) Reporte de validación (incluye columnas nuevas)
         reporte_validacion_bytes = build_excel_output(aprobados_view, "Aprobados_Completo")
-
-        # 3) Observados
         obs_bytes = build_excel_output(observados_view, "Observados")
 
         st.download_button(
