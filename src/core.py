@@ -12,6 +12,7 @@ from .normalizer import (
     normalize_text_spaces,
     first_phone,
     doc_key8_for_match,
+    person_key_for_match,
 )
 from .correo import generar_correo_institucional
 from .config import (
@@ -175,15 +176,17 @@ def _find_col_contains(df: pd.DataFrame, needle: str) -> Optional[str]:
             return c
     return None
 
-def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str]]:
+
+def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str], Dict[str, str]]:
     """
     Retorna:
       - emails_existentes: set de correos (User principal name)
       - doc8_to_email: doc_key8 (desde Fax) -> correo
+      - personkey_to_email: clave por apellidos+nombres -> correo (fallback)
     """
     df = _read_outlook(outlook_path)
     if df is None or df.empty:
-        return set(), {}
+        return set(), {}, {}
 
     email_col = (
         _find_col_contains(df, "user principal name")
@@ -193,6 +196,11 @@ def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str]]:
     )
     fax_col = _find_col_contains(df, "fax")
 
+    # Columnas de nombres (según export)
+    display_col = _find_col_contains(df, "display name") or _find_col_contains(df, "displayname")
+    given_col   = _find_col_contains(df, "given name") or _find_col_contains(df, "givenname") or _find_col_contains(df, "first name")
+    surname_col = _find_col_contains(df, "surname") or _find_col_contains(df, "last name") or _find_col_contains(df, "lastname")
+
     if not email_col:
         raise ValueError("Outlook: No encontré la columna 'User principal name' (correo).")
     if not fax_col:
@@ -200,6 +208,7 @@ def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str]]:
 
     emails_existentes: Set[str] = set()
     doc8_to_email: Dict[str, str] = {}
+    personkey_to_email: Dict[str, str] = {}
 
     for _, row in df.iterrows():
         email = str(row.get(email_col, "")).strip().lower()
@@ -208,13 +217,52 @@ def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str]]:
 
         emails_existentes.add(email)
 
+        # 1) Index por documento (FAX -> doc_key8)
         fax_digits = _only_digits(row.get(fax_col))
         if fax_digits:
             k8 = doc_key8_for_match(fax_digits)  # SIEMPRE 8
             if k8 and k8 not in doc8_to_email:
                 doc8_to_email[k8] = email
 
-    return emails_existentes, doc8_to_email
+        # 2) Index por nombre/apellidos (fallback)
+        display = str(row.get(display_col, "")).strip() if display_col else ""
+        given = str(row.get(given_col, "")).strip() if given_col else ""
+        surname = str(row.get(surname_col, "")).strip() if surname_col else ""
+
+        ap_pat = ""
+        ap_mat = ""
+        nombres = ""
+
+        if display:
+            # Intento 1: "AP1 AP2, NOMBRES"
+            if "," in display:
+                left, right = display.split(",", 1)
+                ap_parts = [p for p in left.strip().split() if p]
+                nm_parts = [p for p in right.strip().split() if p]
+                ap_pat = ap_parts[0] if len(ap_parts) >= 1 else ""
+                ap_mat = ap_parts[1] if len(ap_parts) >= 2 else ""
+                nombres = " ".join(nm_parts) if nm_parts else ""
+            else:
+                # Intento 2: "AP1 AP2 NOMBRES..."
+                parts = [p for p in display.strip().split() if p]
+                if len(parts) >= 3:
+                    ap_pat = parts[0]
+                    ap_mat = parts[1]
+                    nombres = " ".join(parts[2:])
+
+        # Fallback: given + surname
+        if (not ap_pat and not ap_mat and not nombres) and (given or surname):
+            ap_parts = [p for p in surname.strip().split() if p]
+            ap_pat = ap_parts[0] if len(ap_parts) >= 1 else surname
+            ap_mat = ap_parts[1] if len(ap_parts) >= 2 else ""
+            nombres = given
+
+        if ap_pat or ap_mat or nombres:
+            pk = person_key_for_match(ap_pat, ap_mat, nombres)
+            if pk and pk not in personkey_to_email:
+                personkey_to_email[pk] = email
+
+    return emails_existentes, doc8_to_email, personkey_to_email
 
 
 # =========================
@@ -290,7 +338,7 @@ def generate_outputs(
     sedes_map, _, sedes_name_col = _build_catalog_map_by_name(sedes_df, key_col_hint="nombre", name_col_hint="nombre")
 
     # Outlook index
-    outlook_emails, outlook_doc8_to_email = read_outlook_indexes(outlook_path)
+    outlook_emails, outlook_doc8_to_email, outlook_personkey_to_email = read_outlook_indexes(outlook_path)
     existentes: Set[str] = set(outlook_emails)
 
     # Historial opcional (para no repetir en otra ejecución)
@@ -349,7 +397,7 @@ def generate_outputs(
             add_observado(base, f"No match TipoDocumento para '{tipo_doc_raw}'")
             continue
 
-        # Documento: plantilla DNI=8 / CE=9, pero MATCH=8
+        # Documento: DNI=8 / CE=9, MATCH=8 (desde doc_key8_for_match)
         doc_raw = str(r[col["documento"]]).strip() if col.get("documento") else ""
         if _is_blank(doc_raw):
             add_observado(base, "Documento vacío")
@@ -361,14 +409,17 @@ def generate_outputs(
             continue
 
         is_ce = ("carnet" in tipo_doc_norm) or ("extran" in tipo_doc_norm) or (tipo_doc_norm == "ce")
-        if is_ce:
-            doc_out = doc_digits.zfill(9)[:9]   # CE a 9
-        else:
-            doc_out = doc_digits.zfill(8)[:8]   # DNI a 8
+        target_len = 9 if is_ce else 8
 
+        # Si viene con más dígitos de lo permitido -> OBSERVADO
+        if len(doc_digits) > target_len:
+            add_observado(base, f"Documento con longitud inválida para {'CE' if is_ce else 'DNI'}: '{doc_digits}'")
+            continue
+
+        doc_out = doc_digits.zfill(target_len)
         doc_key8 = doc_key8_for_match(doc_out)  # MATCH SIEMPRE 8
 
-        # ✅ si ya fue generado antes (historial), lo saltamos (opcional)
+        # Historial opcional: no repetir
         if doc_key8 and doc_key8 in history_doc8:
             add_observado(base, "Ya fue generado en un proceso anterior (historial).")
             continue
@@ -420,8 +471,20 @@ def generate_outputs(
             ciclo_int = 0
         estado_key = estado_estudiante_key(ciclo_int if ciclo_int else 0)
 
-        # Validación correo existente por doc_key8
+        # =========================
+        # Correo institucional:
+        # 1) Match por doc_key8 (Fax)
+        # 2) Si no coincide, match por nombre+apellidos (fallback)
+        # =========================
         correo_existente = outlook_doc8_to_email.get(doc_key8)
+
+        if not correo_existente:
+            pk = person_key_for_match(
+                str(r[col["ap_paterno"]]),
+                str(r[col["ap_materno"]]),
+                str(r[col["nombres"]]),
+            )
+            correo_existente = outlook_personkey_to_email.get(pk)
 
         tiene_correo = "NO"
         estado_correo = "GENERAR"
