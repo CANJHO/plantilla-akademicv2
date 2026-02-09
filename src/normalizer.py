@@ -2,9 +2,11 @@
 import re
 import unicodedata
 
+
 def strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     return "".join([c for c in s if not unicodedata.combining(c)])
+
 
 def normalize_text_no_spaces(s: str) -> str:
     if s is None:
@@ -12,14 +14,13 @@ def normalize_text_no_spaces(s: str) -> str:
     s = str(s).strip().lower()
     s = strip_accents(s)
     s = s.replace("ñ", "n")
-    # quitar caracteres especiales (dejamos letras/números/espacio para procesar, luego quitamos espacios)
     s = re.sub(r"[^a-z0-9\s]", "", s)
-    # eliminar espacios completamente
     s = re.sub(r"\s+", "", s)
     return s
 
+
 def normalize_text_spaces(s: str) -> str:
-    """Para matches por nombre (programa, etc.): minúscula/sin tildes/ñ->n, pero conservando 1 espacio."""
+    """minúscula/sin tildes/ñ->n, conservando 1 espacio."""
     if s is None:
         return ""
     s = str(s).strip().lower()
@@ -28,6 +29,7 @@ def normalize_text_spaces(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def parse_money_to_float(val) -> float:
     if val is None:
@@ -43,6 +45,7 @@ def parse_money_to_float(val) -> float:
     except:
         return 0.0
 
+
 def first_phone(telefonos: str) -> str:
     if telefonos is None:
         return ""
@@ -51,21 +54,23 @@ def first_phone(telefonos: str) -> str:
     parts = [p.strip() for p in parts if p.strip()]
     return parts[0] if parts else s
 
-# ✅ NUEVO: limpiar campo correo personal (solo el primero)
+
+# =========================
+# Email
+# =========================
 _EMAIL_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.IGNORECASE)
 
 def first_email(value) -> str:
     """
     Extrae el primer email válido desde un campo sucio:
-    - elimina comas/puntos al inicio
-    - si hay varios emails separados por coma/; espacio salto de línea -> toma el primero
+    - si hay varios separados por coma/; espacio salto de línea -> toma el primero
     - devuelve en minúscula
     """
     if value is None:
         return ""
 
     s = str(value).strip().lower()
-    if not s or s in ("nan", "none"):
+    if not s or s in ("nan", "none", "null"):
         return ""
 
     s = s.replace("mailto:", " ").strip()
@@ -79,20 +84,18 @@ def first_email(value) -> str:
     if not m:
         return ""
 
-    email = m.group(0).strip(" ,.;:")
-    return email
+    return m.group(0).strip(" ,.;:")
+
+
+# =========================
+# Empty handling
+# =========================
 def empty_to_blank(v) -> str:
-    """
-    Convierte valores vacíos a "":
-    - None
-    - NaN (float nan)
-    - "nan", "none", ""
-    """
+    """Convierte valores vacíos a '' (None/NaN/'nan'/etc)."""
     if v is None:
         return ""
     try:
-        # pandas nan
-        if isinstance(v, float) and v != v:
+        if isinstance(v, float) and v != v:  # NaN
             return ""
     except:
         pass
@@ -102,3 +105,43 @@ def empty_to_blank(v) -> str:
     if s.lower() in ("nan", "none", "null", "n/a"):
         return ""
     return s
+
+
+# =========================
+# Document normalization
+# =========================
+def normalize_document_number(doc: str, *, is_ce: bool) -> str:
+    """
+    Normaliza el documento para ESCRIBIR en plantilla:
+    - DNI: 8 dígitos (pad izquierda)
+    - CE: 9 dígitos (pad izquierda)
+    """
+    if doc is None:
+        return ""
+    s = re.sub(r"\D", "", str(doc).strip())
+    if not s:
+        return ""
+    if is_ce:
+        return s.zfill(9)[:9]
+    return s.zfill(8)[:8]
+
+
+def doc_key8_for_match(doc: str) -> str:
+    """
+    Clave para MATCH: SIEMPRE 8 dígitos.
+    - Extrae dígitos.
+    - Si son 9 (CE), toma los ÚLTIMOS 8.
+    """
+    if doc is None:
+        return ""
+    s = re.sub(r"\D", "", str(doc).strip())
+    if not s:
+        return ""
+    if len(s) >= 8:
+        return s[-8:]
+    return s.zfill(8)
+
+
+def person_key_for_match(ap_paterno: str, ap_materno: str, nombres: str) -> str:
+    """Clave fallback por nombres/apellidos (sin espacios/símbolos)."""
+    return normalize_text_no_spaces(f"{ap_paterno} {ap_materno} {nombres}")

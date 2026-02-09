@@ -1,16 +1,18 @@
 # src/core.py
 from __future__ import annotations
 
+import re
 import pandas as pd
 from datetime import datetime
 from typing import Dict, Any, List, Set, Tuple, Optional
 
 from .excel_utils import read_consolidado, load_template_catalogs, detect_columns
 from .normalizer import (
-    parse_money_to_float, normalize_text_spaces,
-    first_phone, first_email, empty_to_blank
+    parse_money_to_float,
+    normalize_text_spaces,
+    first_phone,
+    doc_key8_for_match,
 )
-
 from .correo import generar_correo_institucional
 from .config import (
     CAMPUS_MAP, TIPO_ADMISION_MAP, OUTLOOK_DOMAIN,
@@ -21,6 +23,54 @@ from .config import (
 SHEET_TARGET = "SubidaEstudiantes"
 
 
+# =========================
+# Helpers locales
+# =========================
+def _only_digits(val: Any) -> str:
+    s = "" if val is None else str(val)
+    return "".join(ch for ch in s if ch.isdigit())
+
+def _is_blank(val: Any) -> bool:
+    if val is None:
+        return True
+    s = str(val).strip()
+    if s == "":
+        return True
+    if s.lower() in {"nan", "none", "null"}:
+        return True
+    return False
+
+def _as_dash(val: Any) -> str:
+    """Convierte vacío/NaN/'nan' a '-'."""
+    return "-" if _is_blank(val) else str(val).strip()
+
+_EMAIL_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.IGNORECASE)
+
+def _first_email(val: Any) -> str:
+    """
+    Extrae el primer email válido desde un campo sucio:
+      ', kim@gmail.com' -> 'kim@gmail.com'
+      'a@x.com, b@y.com' -> 'a@x.com'
+      'a@x.com b@y.com' -> 'a@x.com'
+    """
+    if _is_blank(val):
+        return ""
+    s = str(val).strip().lower()
+
+    # normalizar separadores
+    for sep in [",", ";", "|", "\n", "\t"]:
+        s = s.replace(sep, " ")
+    s = re.sub(r"\s+", " ", s).strip()
+
+    m = _EMAIL_RE.search(s)
+    if not m:
+        return ""
+    return m.group(0).strip(" ,.;:")
+
+
+# =========================
+# Catalog map
+# =========================
 def _build_catalog_map_by_name(
     df: pd.DataFrame,
     key_col_hint: str,
@@ -51,7 +101,7 @@ def _build_catalog_map_by_name(
 
 
 # =========================
-# ✅ PROGRAMA + PLAN (TABLA MAESTRA)
+# PROGRAMA + PLAN (TABLA MAESTRA)
 # =========================
 def _build_program_lookup() -> Dict[Tuple[str, bool], Tuple[str, str]]:
     lookup: Dict[Tuple[str, bool], Tuple[str, str]] = {}
@@ -67,7 +117,6 @@ def _resolve_program(programa_academico: str, is_virtual: bool) -> Optional[Tupl
     if key in PROGRAM_LOOKUP:
         return PROGRAM_LOOKUP[key]
 
-    # fallback por contiene (variaciones leves)
     prog_norm = key[0]
     for (name_norm, vflag), val in PROGRAM_LOOKUP.items():
         if vflag == is_virtual and (prog_norm in name_norm or name_norm in prog_norm):
@@ -77,7 +126,7 @@ def _resolve_program(programa_academico: str, is_virtual: bool) -> Optional[Tupl
 
 
 # =========================
-# ✅ PAGADO: detectar columna real por contenido (BF)
+# PAGADO: detectar columna real por contenido (BF)
 # =========================
 def _guess_pagado_column(df: pd.DataFrame, detected_col: Optional[str]) -> str:
     candidates: List[str] = []
@@ -112,13 +161,10 @@ def _guess_pagado_column(df: pd.DataFrame, detected_col: Optional[str]) -> str:
 
 
 # =========================
-# ✅ OUTLOOK: leer por columnas EXACTAS:
-# - Correo: "User principal name"
-# - DNI: "Fax"
+# OUTLOOK
 # =========================
 def _read_outlook(path: str) -> pd.DataFrame:
     if path.lower().endswith(".csv"):
-        # autodetect separador, evita CSV con ; o ,
         return pd.read_csv(path, sep=None, engine="python")
     return pd.read_excel(path, engine="openpyxl")
 
@@ -129,57 +175,31 @@ def _find_col_contains(df: pd.DataFrame, needle: str) -> Optional[str]:
             return c
     return None
 
-def _extract_digits(s: Any) -> str:
-    txt = "" if s is None else str(s)
-    digits = "".join(ch for ch in txt if ch.isdigit())
-    return digits
-
-def _extract_dni_from_fax(fax_val: Any) -> Optional[str]:
-    d = _extract_digits(fax_val)
-    # DNI Perú usualmente 8 dígitos; si viniera con más, tomamos últimos 8 si tiene sentido
-    if len(d) == 8:
-        return d
-    if len(d) > 8:
-        # a veces viene como 00000000 o con prefijos
-        # preferimos los últimos 8 si parecen DNI
-        return d[-8:]
-    return None
-
-def _norm_person_key(nombres: str, ap_pat: str, ap_mat: str) -> str:
-    # clave muy tolerante: tokens ordenados
-    full = normalize_text_spaces(f"{nombres} {ap_pat} {ap_mat}").upper()
-    toks = [t for t in full.split() if t]
-    toks.sort()
-    return " ".join(toks)
-
-def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str], Dict[str, str]]:
+def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str]]:
     """
     Retorna:
       - emails_existentes: set de correos (User principal name)
-      - dni_to_email: DNI -> correo
-      - email_to_personkey: correo -> clave nombre/apellidos (si hay columnas de nombre)
+      - doc8_to_email: doc_key8 (desde Fax) -> correo
     """
     df = _read_outlook(outlook_path)
     if df is None or df.empty:
-        return set(), {}, {}
+        return set(), {}
 
-    email_col = _find_col_contains(df, "user principal name") or _find_col_contains(df, "userprincipalname") or _find_col_contains(df, "mail") or _find_col_contains(df, "email")
+    email_col = (
+        _find_col_contains(df, "user principal name")
+        or _find_col_contains(df, "userprincipalname")
+        or _find_col_contains(df, "mail")
+        or _find_col_contains(df, "email")
+    )
     fax_col = _find_col_contains(df, "fax")
 
     if not email_col:
         raise ValueError("Outlook: No encontré la columna 'User principal name' (correo).")
     if not fax_col:
-        # tú dijiste que está como Fax, entonces lo exigimos
-        raise ValueError("Outlook: No encontré la columna 'Fax' (DNI).")
-
-    # columnas de nombre (opcional) para fallback por nombres
-    given_col = _find_col_contains(df, "given name") or _find_col_contains(df, "givenname") or _find_col_contains(df, "first name") or _find_col_contains(df, "firstname")
-    sur_col = _find_col_contains(df, "surname") or _find_col_contains(df, "last name") or _find_col_contains(df, "lastname")
-    disp_col = _find_col_contains(df, "display name") or _find_col_contains(df, "displayname") or _find_col_contains(df, "nombre")
+        raise ValueError("Outlook: No encontré la columna 'Fax' (documento).")
 
     emails_existentes: Set[str] = set()
-    dni_to_email: Dict[str, str] = {}
-    email_to_personkey: Dict[str, str] = {}
+    doc8_to_email: Dict[str, str] = {}
 
     for _, row in df.iterrows():
         email = str(row.get(email_col, "")).strip().lower()
@@ -188,59 +208,65 @@ def read_outlook_indexes(outlook_path: str) -> Tuple[Set[str], Dict[str, str], D
 
         emails_existentes.add(email)
 
-        dni = _extract_dni_from_fax(row.get(fax_col))
-        if dni:
-            # si el DNI aparece varias veces, conservamos el primero (o el último, es indistinto)
-            dni_to_email[dni] = email
+        fax_digits = _only_digits(row.get(fax_col))
+        if fax_digits:
+            k8 = doc_key8_for_match(fax_digits)  # SIEMPRE 8
+            if k8 and k8 not in doc8_to_email:
+                doc8_to_email[k8] = email
 
-        # armar personkey si hay info
-        if disp_col and str(row.get(disp_col, "")).strip():
-            # displayname en una sola columna
-            pk = normalize_text_spaces(str(row.get(disp_col))).upper()
-            email_to_personkey[email] = pk
+    return emails_existentes, doc8_to_email
+
+
+# =========================
+# HISTORIAL (opcional) para no repetir en otra ejecución
+# =========================
+def read_history_doc8(history_path: Optional[str]) -> Set[str]:
+    """
+    Lee un Excel/CSV histórico con una columna llamada:
+    - doc8
+    o
+    - N°_Documento
+    o
+    - Documento
+    y devuelve set(doc_key8)
+    """
+    if not history_path:
+        return set()
+
+    try:
+        if history_path.lower().endswith(".csv"):
+            hdf = pd.read_csv(history_path, sep=None, engine="python")
         else:
-            # given + surname (si existen)
-            gn = str(row.get(given_col, "")).strip() if given_col else ""
-            sn = str(row.get(sur_col, "")).strip() if sur_col else ""
-            if gn or sn:
-                pk = normalize_text_spaces(f"{gn} {sn}").upper()
-                email_to_personkey[email] = pk
+            hdf = pd.read_excel(history_path, engine="openpyxl")
+    except:
+        return set()
 
-    return emails_existentes, dni_to_email, email_to_personkey
+    if hdf is None or hdf.empty:
+        return set()
 
+    cols = {normalize_text_spaces(c): c for c in hdf.columns.astype(str)}
+    pick = cols.get("doc8") or cols.get("n documento") or cols.get("documento") or cols.get("n° documento") or None
+    if not pick:
+        return set()
 
-def _match_por_nombres(
-    nombres: str, ap_pat: str, ap_mat: str,
-    email: str,
-    email_to_personkey: Dict[str, str]
-) -> bool:
-    """
-    Fallback si no hay DNI:
-    - compara tokens (muy tolerante) contra displayname/given+surname si existe.
-    """
-    pk_out = email_to_personkey.get(email, "")
-    if not pk_out:
-        return False
-
-    # tokens del alumno
-    alumno_key = _norm_person_key(nombres, ap_pat, ap_mat)
-    out_key = normalize_text_spaces(pk_out).upper()
-
-    # condición mínima: al menos 1 apellido y 1 nombre aparezcan
-    alumno_tokens = set(alumno_key.split())
-    out_tokens = set(out_key.split())
-
-    if not alumno_tokens or not out_tokens:
-        return False
-
-    # heurística: si coinciden 2+ tokens, lo tomamos como mismo alumno
-    return len(alumno_tokens & out_tokens) >= 2
+    out: Set[str] = set()
+    for v in hdf[pick].dropna().astype(str):
+        k8 = doc_key8_for_match(v)
+        if k8:
+            out.add(k8)
+    return out
 
 
 # =========================
 # MAIN
 # =========================
-def generate_outputs(consolidado_path: str, outlook_path: str, template_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def generate_outputs(
+    consolidado_path: str,
+    outlook_path: str,
+    template_path: str,
+    history_path: Optional[str] = None,   # ✅ opcional
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
     df = read_consolidado(consolidado_path)
     col = detect_columns(df)
 
@@ -248,14 +274,12 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
     if missing:
         raise ValueError(f"Faltan columnas obligatorias en consolidado: {missing}")
 
-    # ✅ PAGADO: usar la columna real por contenido
+    # PAGADO
     pagado_col_real = _guess_pagado_column(df, col.get("pagado"))
     df["_pagado_num"] = df[pagado_col_real].apply(parse_money_to_float)
     df = df[df["_pagado_num"] > 0].copy()
 
-    # plantilla fija interna
     catalogs = load_template_catalogs(template_path)
-
     tipo_doc_df = catalogs.get("TipoDocumentos")
     sedes_df = catalogs.get("Sedes-Campus")
 
@@ -265,11 +289,12 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
     tipo_doc_map, _, _ = _build_catalog_map_by_name(tipo_doc_df, key_col_hint="key", name_col_hint="nombre")
     sedes_map, _, sedes_name_col = _build_catalog_map_by_name(sedes_df, key_col_hint="nombre", name_col_hint="nombre")
 
-    # ✅ Outlook index por DNI(Fax) y correo(User principal name)
-    outlook_emails, outlook_dni_to_email, outlook_email_to_personkey = read_outlook_indexes(outlook_path)
-
-    # Set de “ocupados”: todo lo que ya existe en Outlook
+    # Outlook index
+    outlook_emails, outlook_doc8_to_email = read_outlook_indexes(outlook_path)
     existentes: Set[str] = set(outlook_emails)
+
+    # Historial opcional (para no repetir en otra ejecución)
+    history_doc8 = read_history_doc8(history_path)
 
     aprobados_rows: List[Dict[str, Any]] = []
     observados_rows: List[Dict[str, Any]] = []
@@ -287,7 +312,7 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             "Nombres": r[col["nombres"]],
         }
 
-        # ✅ PROGRAMA + PLAN por tabla maestra + VIR
+        # PROGRAMA + PLAN
         programa_raw = r[col["programa"]] if col.get("programa") else ""
         pension_raw = r[col["pension_escala"]] if col.get("pension_escala") else ""
         is_virtual = es_virtual_por_pension(pension_raw)
@@ -298,7 +323,7 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             continue
 
         program_code, plan_rel = resolved
-        escuela_code = program_code  # Pxx / PxxV
+        escuela_code = program_code
 
         # Campus
         campus_raw = str(r[col["sede_filial"]]).strip().upper() if col.get("sede_filial") else ""
@@ -311,7 +336,7 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             add_observado(base, f"Campus no válido: origen='{campus_raw}' mapeado='{campus_mapped}'")
             continue
 
-        # Tipo documento
+        # Tipo documento (Key)
         tipo_doc_raw = str(r[col["tipo_doc"]]).strip() if col.get("tipo_doc") else ""
         tipo_doc_norm = normalize_text_spaces(tipo_doc_raw)
         tipo_doc_key = None
@@ -324,29 +349,40 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             add_observado(base, f"No match TipoDocumento para '{tipo_doc_raw}'")
             continue
 
-        # Documento (DNI)
-        doc = str(r[col["documento"]]).strip() if col.get("documento") else ""
-        if not doc:
+        # Documento: plantilla DNI=8 / CE=9, pero MATCH=8
+        doc_raw = str(r[col["documento"]]).strip() if col.get("documento") else ""
+        if _is_blank(doc_raw):
             add_observado(base, "Documento vacío")
             continue
 
-        dni = _extract_digits(doc)
-        if len(dni) != 8:
-            # si tu documento no siempre es DNI 8 dígitos, quita esta validación
-            # pero para tu caso, es DNI.
-            dni = dni[-8:] if len(dni) > 8 else dni
+        doc_digits = _only_digits(doc_raw)
+        if not doc_digits:
+            add_observado(base, f"Documento inválido: '{doc_raw}'")
+            continue
 
-        mail_personal = first_email(r[col["mail_personal"]]) if col.get("mail_personal") else ""
+        is_ce = ("carnet" in tipo_doc_norm) or ("extran" in tipo_doc_norm) or (tipo_doc_norm == "ce")
+        if is_ce:
+            doc_out = doc_digits.zfill(9)[:9]   # CE a 9
+        else:
+            doc_out = doc_digits.zfill(8)[:8]   # DNI a 8
+
+        doc_key8 = doc_key8_for_match(doc_out)  # MATCH SIEMPRE 8
+
+        # ✅ si ya fue generado antes (historial), lo saltamos (opcional)
+        if doc_key8 and doc_key8 in history_doc8:
+            add_observado(base, "Ya fue generado en un proceso anterior (historial).")
+            continue
+
+        # Correo personal, Teléfono, Dirección
+        mail_personal = _first_email(r[col["mail_personal"]]) if col.get("mail_personal") else ""
         mail_personal = mail_personal if mail_personal else "-"
 
         tel = first_phone(r[col["telefonos"]]) if col.get("telefonos") else ""
-        tel = tel.strip() if isinstance(tel, str) else str(tel).strip()
-        tel = tel if tel else "-"
+        tel = "-" if _is_blank(tel) else str(tel).strip()
 
-        direccion_raw = empty_to_blank(r[col["direccion"]]) if col.get("direccion") else ""
-        direccion = direccion_raw if direccion_raw else "-"
+        direccion = _as_dash(r[col["direccion"]]) if col.get("direccion") else "-"
 
-        # Fecha nacimiento dd/mm/yyyy texto
+        # Fecha nacimiento
         fecha_txt = ""
         if col.get("fecha_nac"):
             v = r[col["fecha_nac"]]
@@ -364,7 +400,7 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
 
         periodo_ing = str(r[col["inicio"]]).strip() if col.get("inicio") else ""
 
-        # Tipo admisión (test válido)
+        # Tipo admisión
         modalidad_raw = str(r[col["modalidad"]]).strip() if col.get("modalidad") else ""
         modalidad_norm = modalidad_raw.strip().upper()
         adm_id = None
@@ -384,56 +420,29 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             ciclo_int = 0
         estado_key = estado_estudiante_key(ciclo_int if ciclo_int else 0)
 
-        # =========================
-        # ✅ VALIDACIÓN CORREO EXISTENTE POR DNI (Fax)
-        # =========================
-        correo_existente = outlook_dni_to_email.get(dni)
+        # Validación correo existente por doc_key8
+        correo_existente = outlook_doc8_to_email.get(doc_key8)
+
         tiene_correo = "NO"
         estado_correo = "GENERAR"
         correo_inst: Optional[str] = None
 
         if correo_existente:
-            # mismo alumno por DNI -> usar correo existente, NO generar otro
             correo_inst = correo_existente
             tiene_correo = "SI"
             estado_correo = "YA_TIENE"
         else:
-            # =========================
-            # ✅ Fallback por nombres/apellidos si no hay DNI en Outlook
-            # =========================
-            # primero generamos un candidato y, si ese candidato ya existe,
-            # verificamos si corresponde al mismo alumno por nombres.
-            candidato, errs = generar_correo_institucional(
+            correo_inst, errs = generar_correo_institucional(
                 nombres=str(r[col["nombres"]]),
                 ap_paterno=str(r[col["ap_paterno"]]),
                 ap_materno=str(r[col["ap_materno"]]),
                 dominio=OUTLOOK_DOMAIN,
                 existentes=existentes
             )
-            if candidato is None:
+            if correo_inst is None:
                 add_observado(base, "; ".join(errs) if errs else "No se pudo generar correo")
                 continue
 
-            # Si el candidato existe en Outlook, intentar decidir si es el mismo alumno por nombres
-            if candidato in outlook_emails:
-                if _match_por_nombres(
-                    nombres=str(r[col["nombres"]]),
-                    ap_pat=str(r[col["ap_paterno"]]),
-                    ap_mat=str(r[col["ap_materno"]]),
-                    email=candidato,
-                    email_to_personkey=outlook_email_to_personkey
-                ):
-                    correo_inst = candidato
-                    tiene_correo = "SI"
-                    estado_correo = "YA_TIENE"
-                else:
-                    # no es el mismo alumno -> candidato fue generado evitando existentes,
-                    # así que aquí solo asignamos
-                    correo_inst = candidato
-            else:
-                correo_inst = candidato
-
-            # Reservar para evitar duplicados dentro del mismo lote
             existentes.add(correo_inst)
 
         out = {
@@ -447,7 +456,7 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             "ProgramaAcadémico_RelationId(-)": escuela_code,
             "Campus_Nombre": campus_mapped,
             "TipoDocument_Key": tipo_doc_key,
-            "N°_Documento": doc,
+            "N°_Documento": doc_out,
             "CorreoInstitucional": correo_inst,
             "CorreoPersonal(-)": mail_personal,
             "Telefono": tel,
@@ -461,9 +470,8 @@ def generate_outputs(consolidado_path: str, outlook_path: str, template_path: st
             "TipoDeAdmission_RelationId": adm_id,
             "EstadoEstudiante_Key": estado_key,
 
-            # ✅ NUEVAS COLUMNAS (lo que pediste)
-            "TieneCorreoInstitucional": tiene_correo,   # SI/NO
-            "EstadoCorreoInstitucional": estado_correo, # YA_TIENE / GENERAR
+            "TieneCorreoInstitucional": tiene_correo,
+            "EstadoCorreoInstitucional": estado_correo,
         }
 
         aprobados_rows.append(out)
