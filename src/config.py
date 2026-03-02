@@ -58,7 +58,7 @@ TIPO_ADMISION_MAP = {
     "MODALIDAD ORDINARIA (PROMOCIÓN 50% Y 30%)": "test",
     "MODALIDAD ORDINARIO REGULAR": "test",
     "TRASLADO UNIVER. LICENCIA DENEGADA": 5,
-    "GENERAL - TRASLADOS EXTERNOS": 7,
+    "GENERAL - TRASLADOS EXTERNO": 7,
 }
 
 def estado_estudiante_key(ciclo: int) -> int:
